@@ -48,6 +48,11 @@ class MempoolApi {
   async getBlock (hash) {
     return await this._request(`/v1/block/${hash}`)
   }
+
+  async getAddressTxsChain ({ address, lastSeenTxid }) {
+    const suffix = lastSeenTxid ? `/${lastSeenTxid}` : ''
+    return await this._request(`/address/${address}/txs/chain${suffix}`)
+  }
 }
 
 module.exports = MempoolApi
