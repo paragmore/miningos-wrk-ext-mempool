@@ -13,7 +13,8 @@ const {
   HISTORICAL_PRICES_DATA_KEY,
   HISTORICAL_BLOCKSIZES_DATA_KEY,
   HISTORICAL_HASHRATE_DATA_KEY,
-  HISTORICAL_DATA_START_TS
+  HISTORICAL_DATA_START_TS,
+  POOL_REBATES_DATA_KEY
 } = require('../../workers/lib/constants')
 const { getUTCMidnightTimestampsSince } = require('../../workers/lib/utils')
 
@@ -473,6 +474,90 @@ test('getWrkExtData returns full non-historical payload when no fields', async (
   t.absent(out.prices)
   t.is(out.currentPrice, 10)
   t.is(out.blockHeight, 1)
+})
+
+const addressTx = (txid, blockTime) => ({
+  txid,
+  status: { confirmed: true, block_time: blockTime },
+  vin: [],
+  vout: []
+})
+
+const addressTxsWrk = (pages) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const calls = []
+  wrk._rateLimitDelay = async () => {}
+  wrk.mempoolApi = {
+    getAddressTxsChain: async ({ address, lastSeenTxid }) => {
+      calls.push({ address, lastSeenTxid })
+      return pages[calls.length - 1] ?? []
+    }
+  }
+  return { wrk, calls }
+}
+
+test('_getAddressTxs requires an address', async (t) => {
+  const { wrk } = addressTxsWrk([])
+  await t.exception(() => wrk._getAddressTxs({}), /ERR_ADDRESS_REQUIRED/)
+})
+
+test('_getAddressTxs returns confirmed txs from a single short page', async (t) => {
+  const { wrk, calls } = addressTxsWrk([
+    [addressTx('tx1', 2000), { txid: 'tx2', status: { confirmed: false } }, addressTx('tx3', 1000)]
+  ])
+
+  const out = await wrk._getAddressTxs({ address: 'bc1qaddr' })
+
+  t.alike(calls, [{ address: 'bc1qaddr', lastSeenTxid: undefined }])
+  t.alike(out.map((tx) => tx.txid), ['tx1', 'tx3'])
+})
+
+test('_getAddressTxs paginates full pages via lastSeenTxid', async (t) => {
+  const fullPage = Array.from({ length: 25 }, (_, i) => addressTx(`page1-${i}`, 5000 - i))
+  const { wrk, calls } = addressTxsWrk([fullPage, [addressTx('page2-0', 100)]])
+
+  const out = await wrk._getAddressTxs({ address: 'bc1qaddr' })
+
+  t.is(calls.length, 2)
+  t.is(calls[1].lastSeenTxid, 'page1-24')
+  t.is(out.length, 26)
+})
+
+test('_getAddressTxs stops at sinceTs and drops older txs', async (t) => {
+  const { wrk, calls } = addressTxsWrk([
+    [addressTx('new', 2000), addressTx('old', 999), addressTx('older', 500)]
+  ])
+
+  const out = await wrk._getAddressTxs({ address: 'bc1qaddr', sinceTs: 1000000 })
+
+  t.is(calls.length, 1)
+  t.alike(out.map((tx) => tx.txid), ['new'])
+})
+
+test('_getAddressTxs propagates api errors', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  wrk._rateLimitDelay = async () => {}
+  wrk.mempoolApi = {
+    getAddressTxsChain: async () => { throw new Error('ERR_HTTP') }
+  }
+
+  await t.exception(() => wrk._getAddressTxs({ address: 'bc1qaddr' }), /ERR_HTTP/)
+})
+
+test('getWrkExtData routes POOL_REBATES to the stored rebates', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  let captured = null
+  wrk._getPoolRebates = async (query) => {
+    captured = query
+    return [{ txid: 'tx1' }]
+  }
+
+  const out = await wrk.getWrkExtData({
+    query: { key: POOL_REBATES_DATA_KEY, start: 1, end: 2 }
+  })
+
+  t.alike(captured, { key: POOL_REBATES_DATA_KEY, start: 1, end: 2 })
+  t.alike(out, [{ txid: 'tx1' }])
 })
 
 test('_readFromDb returns null when no mempool key', async (t) => {

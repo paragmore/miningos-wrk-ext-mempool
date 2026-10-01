@@ -13,8 +13,20 @@ const {
   HISTORICAL_BLOCKSIZES_DATA_KEY,
   STAT_HASHRATE_HISTORY,
   HISTORICAL_HASHRATE_DATA_KEY,
-  HISTORICAL_DATA_START_TS
+  HISTORICAL_DATA_START_TS,
+  ADDRESS_TXS_PAGE_SIZE,
+  ADDRESS_TXS_MAX_PAGES,
+  POOL_REBATES_DATA_KEY,
+  POOL_REBATES_UPDATE_KEY,
+  POOL_REBATES_DELETE_KEY,
+  POOL_REBATES_BEE,
+  POOL_REBATES_DELETED_BEE,
+  POOL_REBATES_SYNC_BEE,
+  REBATES_SYNC_TICK_MS,
+  REBATES_SYNC_OVERLAP_MS,
+  REBATES_SYNC_CRON_DEFAULT
 } = require('./lib/constants')
+const { extractRebates, parseDailyCron, lastCronFire } = require('./lib/rebatesSync')
 const { getUTCMidnightTimestampsSince, getUTCMidnightToday } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
@@ -71,6 +83,9 @@ class WrkMempoolRack extends TetherWrkBase {
         this.net_r0.rpcServer.respond('getWrkExtData', async (req) => {
           return await this.net_r0.handleReply('getWrkExtData', req)
         })
+        this.net_r0.rpcServer.respond('setWrkExtData', async (req) => {
+          return await this.net_r0.handleReply('setWrkExtData', req)
+        })
 
         this.mempoolDb = await this.store_s1.getBee({ name: 'mempool' }, { keyEncoding: 'binary' })
         await this.mempoolDb.ready()
@@ -95,6 +110,13 @@ class WrkMempoolRack extends TetherWrkBase {
         } catch (error) {
           console.error('ERR_SAVE_HISTORICAL_DATA', error)
         }
+
+        this.interval_mempool.add(
+          'rebates-sync',
+          this.maybeRunRebatesSync.bind(this),
+          REBATES_SYNC_TICK_MS
+        )
+        this.maybeRunRebatesSync()
       }
     ], cb)
   }
@@ -306,6 +328,10 @@ class WrkMempoolRack extends TetherWrkBase {
     }
   }
 
+  async _rateLimitDelay () {
+    await sleep(1000)
+  }
+
   async _fetchWithDelay (fn, obj, args) {
     // fetch api data with delay due to api rate limits
     await sleep(5000)
@@ -424,7 +450,186 @@ class WrkMempoolRack extends TetherWrkBase {
     if (key === HISTORICAL_PRICES_DATA_KEY) return STAT_PRICES
   }
 
+  // Unlike the polled datasets, errors here must reach the caller: the rebates
+  // sync treats a completed fetch as "window fully scanned", so a swallowed
+  // error (as _fetchWithDelay does) would silently drop transactions.
+  async _getAddressTxs ({ address, sinceTs }) {
+    if (!address) throw new Error('ERR_ADDRESS_REQUIRED')
+    const since = Number.isFinite(sinceTs) ? sinceTs : 0
+    const txs = []
+    let lastSeenTxid
+
+    for (let page = 0; page < ADDRESS_TXS_MAX_PAGES; page++) {
+      await this._rateLimitDelay()
+      const batch = await this.mempoolApi.getAddressTxsChain({ address, lastSeenTxid })
+      if (!Array.isArray(batch) || !batch.length) break
+
+      for (const tx of batch) {
+        if (!tx?.status?.confirmed) continue
+        if (tx.status.block_time * 1000 < since) return txs
+        txs.push(tx)
+      }
+
+      lastSeenTxid = batch[batch.length - 1]?.txid
+      if (batch.length < ADDRESS_TXS_PAGE_SIZE) break
+    }
+
+    return txs
+  }
+
+  async _getRebatesKeyedRow (bee, key) {
+    const db = await this._getBee(bee)
+    const res = await db.get(key)
+    await db.close()
+    return res?.value ? JSON.parse(res.value.toString()) : null
+  }
+
+  async _putRebatesKeyedRow (bee, key, data) {
+    const db = await this._getBee(bee)
+    await db.put(key, Buffer.from(JSON.stringify(data)))
+    await db.close()
+  }
+
+  async _readRebatesRows (bee) {
+    const db = await this._getBee(bee)
+    const rows = []
+    for await (const entry of db.createReadStream()) {
+      rows.push(JSON.parse(entry.value.toString()))
+    }
+    await db.close()
+    return rows
+  }
+
+  async _deleteRebateRow (txid) {
+    const db = await this._getBee(POOL_REBATES_BEE)
+    await db.del(txid)
+    await db.close()
+  }
+
+  async _getRebatesSyncState () {
+    return (await this._getRebatesKeyedRow(POOL_REBATES_SYNC_BEE, 'state')) ?? {}
+  }
+
+  async _setRebatesSyncState (state) {
+    await this._putRebatesKeyedRow(POOL_REBATES_SYNC_BEE, 'state', state)
+  }
+
+  // Runs once per scheduled cron fire (syncCron, UTC). lastRunTs only advances
+  // when every configured address synced, so a failed run is retried on each
+  // tick until the next fire passes with a completed run behind it.
+  async maybeRunRebatesSync () {
+    const conf = this.conf.mempool.rebates || {}
+    const addresses = Array.isArray(conf.addresses) ? conf.addresses.filter(Boolean) : []
+    if (!addresses.length || this._rebatesSyncRunning) return
+
+    let cron
+    try {
+      cron = parseDailyCron(conf.syncCron || REBATES_SYNC_CRON_DEFAULT)
+    } catch (err) {
+      console.error(new Date().toISOString(), 'ERR_REBATES_SYNC_CRON', conf.syncCron)
+      return
+    }
+
+    this._rebatesSyncRunning = true
+    try {
+      const state = await this._getRebatesSyncState()
+      if ((state.lastRunTs || 0) >= lastCronFire(Date.now(), cron)) return
+
+      const { added, firstRun } = await this.runRebatesSync({})
+      if (!firstRun) console.log(new Date().toISOString(), `rebates sync completed, added ${added}`)
+    } catch (err) {
+      console.error(new Date().toISOString(), 'ERR_REBATES_SYNC', err)
+    } finally {
+      this._rebatesSyncRunning = false
+    }
+  }
+
+  async runRebatesSync ({ now = Date.now() }) {
+    const conf = this.conf.mempool.rebates || {}
+    const addresses = Array.isArray(conf.addresses) ? conf.addresses.filter(Boolean) : []
+    const state = await this._getRebatesSyncState()
+
+    // No backfill: the first run only records the deployment moment, and every
+    // later run picks up from the last successful one. An address added later
+    // starts from the current cursor the same way - forward only.
+    if (!Number.isFinite(state.lastSyncedTs)) {
+      await this._setRebatesSyncState({ lastSyncedTs: now, lastRunTs: now })
+      return { added: 0, firstRun: true }
+    }
+
+    // Windows overlap so a run close to the previous cutoff can never miss a
+    // block; txid dedup makes the re-scanned span harmless.
+    const sinceTs = state.lastSyncedTs - REBATES_SYNC_OVERLAP_MS
+    const known = new Set((await this._readRebatesRows(POOL_REBATES_BEE)).map((row) => row.txid))
+    const tombstones = new Set((await this._readRebatesRows(POOL_REBATES_DELETED_BEE)).map((row) => row.txid))
+
+    let added = 0
+    for (const address of addresses) {
+      const txs = await this._getAddressTxs({ address, sinceTs })
+      for (const rebate of extractRebates(txs, address)) {
+        if (known.has(rebate.txid) || tombstones.has(rebate.txid)) continue
+        await this._putRebatesKeyedRow(POOL_REBATES_BEE, rebate.txid, rebate)
+        known.add(rebate.txid)
+        added++
+      }
+    }
+
+    await this._setRebatesSyncState({ lastSyncedTs: now, lastRunTs: now })
+    return { added, firstRun: false }
+  }
+
+  async _getPoolRebates ({ start, end, query, fields, sort, offset, limit }) {
+    const rows = await this._readRebatesRows(POOL_REBATES_BEE)
+    const bounded = rows.filter((row) =>
+      (!Number.isFinite(start) || row.ts >= start) &&
+      (!Number.isFinite(end) || row.ts <= end)
+    )
+
+    const mingoQuery = new mingo.Query(query || {})
+    let cursor = mingoQuery.find(bounded, fields || {})
+    if (!gLibUtilBase.isNil(sort)) cursor = cursor.sort(sort)
+    const skip = Number(offset)
+    if (Number.isFinite(skip) && skip > 0) cursor = cursor.skip(skip)
+    const max = Number(limit)
+    if (Number.isFinite(max) && max > 0) cursor = cursor.limit(max)
+
+    return cursor.all()
+  }
+
+  async setWrkExtData (req) {
+    const { key, value } = req || {}
+
+    // Tombstoning a txid that was never synced is valid: it protects a deleted
+    // manual rebate with that txid from reappearing through a later sync.
+    if (key === POOL_REBATES_DELETE_KEY) {
+      const txid = value?.txid
+      if (!txid) throw new Error('ERR_TXID_REQUIRED')
+      await this._deleteRebateRow(txid)
+      await this._putRebatesKeyedRow(POOL_REBATES_DELETED_BEE, txid, { txid, deletedAt: Date.now() })
+      return true
+    }
+
+    if (key === POOL_REBATES_UPDATE_KEY) {
+      const { txid, ts, amountBTC, sender, receiver } = value || {}
+      if (!txid) throw new Error('ERR_TXID_REQUIRED')
+      if (!Number.isInteger(ts) || ts <= 0) throw new Error('ERR_INVALID_TS')
+      if (!Number.isFinite(amountBTC) || amountBTC <= 0) throw new Error('ERR_INVALID_AMOUNT')
+
+      const existing = await this._getRebatesKeyedRow(POOL_REBATES_BEE, txid)
+      if (!existing) throw new Error('ERR_REBATE_NOT_FOUND')
+
+      await this._putRebatesKeyedRow(POOL_REBATES_BEE, txid, { ...existing, ts, amountBTC, sender, receiver })
+      return true
+    }
+
+    throw new Error('ERR_KEY_INVALID')
+  }
+
   async getWrkExtData (args) {
+    if (args.query?.key === POOL_REBATES_DATA_KEY) {
+      return await this._getPoolRebates(args.query)
+    }
+
     if ([HISTORICAL_PRICES_DATA_KEY, HISTORICAL_BLOCKSIZES_DATA_KEY, HISTORICAL_HASHRATE_DATA_KEY].includes(args.query?.key)) {
       const key = `${this._getHistoricalExtDataLogKey(args.query.key)}-${MEMPOOL_TAG}`
       return await this._getDbData(key, args.query)
