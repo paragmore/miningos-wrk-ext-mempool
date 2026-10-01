@@ -202,12 +202,24 @@ class WrkMempoolRack extends TetherWrkBase {
     )]
 
     for (const bucketTs of buckets) {
+      // convIntToBin writes a 6-byte unsigned int, so a bucket outside
+      // [0, 2^48) would throw and poison the whole batch - one garbage
+      // timestamp must not take down every bucket that did resolve.
+      if (!this._isValidBeeTs(bucketTs)) {
+        missing.push(bucketTs)
+        continue
+      }
+
       const entry = await this._getPriceBucket(bucketTs)
       if (entry?.priceUSD) prices[bucketTs] = entry.priceUSD
       else missing.push(bucketTs)
     }
 
     return { prices, missing }
+  }
+
+  _isValidBeeTs (ts) {
+    return Number.isInteger(ts) && ts >= 0 && ts < 2 ** 48
   }
 
   async _saveHistoricalHashrate (hashrateObj) {
@@ -732,7 +744,9 @@ class WrkMempoolRack extends TetherWrkBase {
     if (key === POOL_REBATES_UPDATE_KEY) {
       const { txid, ts, amountBTC, sender, receiver } = value || {}
       if (!txid) throw new Error('ERR_TXID_REQUIRED')
-      if (!Number.isInteger(ts) || ts <= 0) throw new Error('ERR_INVALID_TS')
+      // Upper bound keeps the re-price bucket lookup inside convIntToBin's
+      // 6-byte range; anything past it is garbage input, not a timestamp.
+      if (!Number.isInteger(ts) || ts <= 0 || !this._isValidBeeTs(ts)) throw new Error('ERR_INVALID_TS')
       if (!Number.isFinite(amountBTC) || amountBTC <= 0) throw new Error('ERR_INVALID_AMOUNT')
 
       const existing = await this._getRebatesKeyedRow(POOL_REBATES_BEE, txid)

@@ -720,3 +720,19 @@ test('_fetchWithDelay serializes concurrent callers instead of releasing them to
   t.is(maxInFlight, 1, 'the sampler and the polling cycles never hit the api together')
   t.alike(order, ['a', 'b', 'c'], 'calls keep their submission order')
 })
+
+test('getPricesAtTimestamps reports out-of-range buckets as missing instead of throwing', async (t) => {
+  const wrk = Object.create(WrkMempoolRack.prototype)
+  const bucket = priceBucket(Date.UTC(2026, 4, 28, 16, 45))
+  wrk.prices5mDb = fakeBee({ [bucket]: { ts: bucket, priceUSD: 64000 } })
+
+  // A negative and a 2^48+ timestamp would blow up convIntToBin's 6-byte
+  // write; one garbage element must not cost the caller the buckets that
+  // did resolve.
+  const res = await wrk.getPricesAtTimestamps({
+    timestamps: [bucket, -5, 9e15]
+  })
+
+  t.alike(res.prices, { [bucket]: 64000 }, 'the valid bucket still resolves')
+  t.alike(res.missing.sort((a, b) => a - b), [priceBucket(-5), priceBucket(9e15)])
+})

@@ -480,3 +480,13 @@ test('setWrkExtData update keeps the stored price when the timestamp is unchange
   t.is(row.amountBTC, 2)
   t.is(row.priceUSD, 64000, 'an amount edit does not lose the receipt price')
 })
+
+test('setWrkExtData update rejects a timestamp past the store key range', async (t) => {
+  const wrk = makeWrk()
+  await wrk._putRebatesKeyedRow(POOL_REBATES_BEE, TXID_A, { txid: TXID_A, ts: 1000, amountBTC: 1 })
+
+  await t.exception(
+    () => wrk.setWrkExtData({ key: POOL_REBATES_UPDATE_KEY, value: { txid: TXID_A, ts: 2 ** 48, amountBTC: 1 } }),
+    /ERR_INVALID_TS/
+  )
+})
