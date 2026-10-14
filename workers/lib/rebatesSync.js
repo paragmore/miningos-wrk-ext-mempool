@@ -2,10 +2,13 @@
 
 const { BTC_SATS } = require('./constants')
 
-// Every confirmed transaction paying `address` is a rebate, except those that
-// also spend from it: change from our own outgoing transfers looks like an
-// incoming payment but is not a rebate.
-function extractRebates (txs, address) {
+// The configured addresses are one wallet. Every confirmed transaction paying
+// any of them is a single rebate for the total it paid the wallet, except
+// transactions that also spend from the wallet: change from our own outgoing
+// transfers and moves between our own addresses look like incoming payments
+// but are not rebates. One row per txid, whichever addresses it touched.
+function extractRebates (txs, addresses) {
+  const addressSet = new Set(Array.isArray(addresses) ? addresses : [addresses])
   const rebates = []
   const seen = new Set()
 
@@ -14,12 +17,16 @@ function extractRebates (txs, address) {
     if (seen.has(tx.txid)) continue
 
     const inputs = Array.isArray(tx.vin) ? tx.vin : []
-    if (inputs.some((vin) => vin?.prevout?.scriptpubkey_address === address)) continue
+    if (inputs.some((vin) => addressSet.has(vin?.prevout?.scriptpubkey_address))) continue
 
-    const sats = (Array.isArray(tx.vout) ? tx.vout : [])
-      .filter((vout) => vout?.scriptpubkey_address === address)
-      .reduce((sum, vout) => sum + (Number(vout.value) || 0), 0)
-    if (sats <= 0) continue
+    const ours = (Array.isArray(tx.vout) ? tx.vout : [])
+      .filter((vout) => addressSet.has(vout?.scriptpubkey_address) && Number(vout.value) > 0)
+    if (!ours.length) continue
+
+    const sats = ours.reduce((sum, vout) => sum + (Number(vout.value) || 0), 0)
+    // The row holds one receiver; for a transaction split across our
+    // addresses, the one that received the largest share represents it.
+    const top = ours.reduce((best, vout) => (Number(vout.value) > Number(best.value) ? vout : best), ours[0])
 
     seen.add(tx.txid)
     rebates.push({
@@ -27,7 +34,7 @@ function extractRebates (txs, address) {
       amountBTC: sats / BTC_SATS,
       txid: tx.txid,
       sender: inputs.find((vin) => vin?.prevout?.scriptpubkey_address)?.prevout.scriptpubkey_address,
-      receiver: address,
+      receiver: top.scriptpubkey_address,
       source: 'auto'
     })
   }

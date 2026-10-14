@@ -669,20 +669,28 @@ class WrkMempoolRack extends TetherWrkBase {
     const known = new Set((await this._readRebatesRows(POOL_REBATES_BEE)).map((row) => row.txid))
     const tombstones = new Set((await this._readRebatesRows(POOL_REBATES_DELETED_BEE)).map((row) => row.txid))
 
-    let added = 0
+    // All addresses are scanned before extraction so a transaction touching
+    // several of them is judged against the whole wallet: its amounts sum into
+    // one row, and a move between our own addresses is recognized as internal
+    // rather than counted as a rebate at the destination.
+    const txsById = new Map()
     for (const address of addresses) {
-      const txs = await this._getAddressTxs({ address, sinceTs })
-      for (const rebate of extractRebates(txs, address)) {
-        if (known.has(rebate.txid) || tombstones.has(rebate.txid)) continue
-        const priceUSD = await this._getReceiptPriceUSD(rebate.ts)
-        await this._putRebatesKeyedRow(
-          POOL_REBATES_BEE,
-          rebate.txid,
-          priceUSD ? { ...rebate, priceUSD } : rebate
-        )
-        known.add(rebate.txid)
-        added++
+      for (const tx of await this._getAddressTxs({ address, sinceTs })) {
+        if (tx?.txid && !txsById.has(tx.txid)) txsById.set(tx.txid, tx)
       }
+    }
+
+    let added = 0
+    for (const rebate of extractRebates([...txsById.values()], addresses)) {
+      if (known.has(rebate.txid) || tombstones.has(rebate.txid)) continue
+      const priceUSD = await this._getReceiptPriceUSD(rebate.ts)
+      await this._putRebatesKeyedRow(
+        POOL_REBATES_BEE,
+        rebate.txid,
+        priceUSD ? { ...rebate, priceUSD } : rebate
+      )
+      known.add(rebate.txid)
+      added++
     }
 
     await this._setRebatesSyncState({ startTs: state.startTs, lastSyncedTs: now, lastRunTs: now })
