@@ -527,3 +527,53 @@ test('setWrkExtData update rejects a timestamp past the store key range', async 
     /ERR_INVALID_TS/
   )
 })
+
+// --- multiple configured addresses -------------------------------------------
+
+test('a tx paying several configured addresses becomes one rebate for the full amount', async (t) => {
+  const sharedTx = tx({
+    txid: TXID_A,
+    vin: [inputFrom('bc1qpool')],
+    vout: [outputTo(ADDRESS, 50000000), outputTo(ADDRESS_2, 30000000)]
+  })
+  // Both address scans surface the same transaction.
+  const wrk = makeWrk({
+    addresses: [ADDRESS, ADDRESS_2],
+    txsByAddress: { [ADDRESS]: [sharedTx], [ADDRESS_2]: [sharedTx] }
+  })
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+
+  const out = await wrk.runRebatesSync({})
+
+  t.is(out.added, 1)
+  const [row] = await storedRebates(wrk)
+  t.is(row.amountBTC, 0.8, 'the wallet received 0.8, not just the first address\'s share')
+  t.is(row.receiver, ADDRESS, 'represented by the address with the largest share')
+})
+
+test('a transfer between two configured addresses is not a rebate', async (t) => {
+  const internalTx = tx({
+    txid: TXID_B,
+    vin: [inputFrom(ADDRESS)],
+    vout: [outputTo(ADDRESS_2, 20000000), outputTo(ADDRESS, 5000000)]
+  })
+  const wrk = makeWrk({
+    addresses: [ADDRESS, ADDRESS_2],
+    txsByAddress: { [ADDRESS]: [internalTx], [ADDRESS_2]: [internalTx] }
+  })
+  await wrk._setRebatesSyncState({ lastSyncedTs: 1, lastRunTs: 0 })
+
+  const out = await wrk.runRebatesSync({})
+
+  t.is(out.added, 0, 'moving money between our own addresses is not new revenue')
+  t.is((await storedRebates(wrk)).length, 0)
+})
+
+test('extractRebates still accepts a single address string', (t) => {
+  const rebates = extractRebates([
+    tx({ txid: TXID_A, vin: [inputFrom('bc1qsender')], vout: [outputTo(ADDRESS, 1000)] })
+  ], ADDRESS)
+
+  t.is(rebates.length, 1)
+  t.is(rebates[0].receiver, ADDRESS)
+})
