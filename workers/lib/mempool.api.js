@@ -49,6 +49,11 @@ class MempoolApi {
     return await this._request(`/v1/block/${hash}`)
   }
 
+  async getBlockHash (height) {
+    const { body } = await this._http.get(`/block-height/${height}`, { encoding: 'text' })
+    return String(body).trim()
+  }
+
   // Extended blocks, newest first, from `height` downwards.
   async getBlocks (height) {
     return await this._request(`/v1/blocks/${height}`)

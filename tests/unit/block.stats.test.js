@@ -2,7 +2,15 @@
 
 const test = require('brittle')
 const WrkMempoolRack = require('../../workers/rack.mempool.ext.wrk')
-const { hourBucket, pickBlocks, groupByHour, addBlocksToRow } = require('../../workers/lib/blockStats')
+const {
+  hourBucket,
+  pickBlocks,
+  groupByHour,
+  addBlocksToRow,
+  addLateBlockToRow,
+  isBlockUnservable
+} = require('../../workers/lib/blockStats')
+const MempoolApi = require('../../workers/lib/mempool.api')
 const {
   MS_1_HOUR,
   MEMPOOL_TAG,
@@ -11,7 +19,8 @@ const {
   BLOCK_STATS_START_TS,
   BLOCK_STATS_SYNC_BEE,
   BLOCK_STATS_CONFIRMATIONS,
-  BLOCK_STATS_PAGE_SIZE
+  BLOCK_STATS_PAGE_SIZE,
+  BLOCK_STATS_SKIPPED_RETRY_MS
 } = require('../../workers/lib/constants')
 
 const STAT_KEY = `${STAT_BLOCK_STATS_1H}-${MEMPOOL_TAG}`
@@ -45,25 +54,41 @@ const expectedRows = (blocks) => {
 const storedSums = (wrk) => {
   const rows = {}
   for (const [ts, row] of wrk.rows) {
-    const { minHeight, maxHeight, ...sums } = row
+    const { minHeight, maxHeight, lateHeights, ...sums } = row
     rows[ts] = sums
   }
   return rows
 }
 
+const httpError = (status) => Object.assign(new Error(`ERR_HTTP: ${status}`), { status })
+
+// `broken` heights behave like a block the upstream index cannot produce: the
+// page holding one fails, and so does the block itself.
 const makeWrk = (chain, { pageSize = BLOCK_STATS_PAGE_SIZE } = {}) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   wrk.chain = chain
   wrk.rows = new Map()
   wrk.state = null
   wrk.pageCalls = []
+  wrk.blockCalls = []
+  wrk.broken = new Set()
+  wrk.brokenStatus = 500
   wrk.mempoolApi = {
     getBlockHeight: async () => wrk.chain[wrk.chain.length - 1].height,
     getBlocks: async (height) => {
       wrk.pageCalls.push(height)
-      return wrk.chain
+      const page = wrk.chain
         .filter((block) => block.height <= height && block.height > height - pageSize)
         .reverse()
+      if (page.some((block) => wrk.broken.has(block.height))) throw httpError(wrk.brokenStatus)
+      return page
+    },
+    getBlockHash: async (height) => `hash-${height}`,
+    getBlock: async (hash) => {
+      const block = wrk.chain.find((candidate) => candidate.id === hash)
+      wrk.blockCalls.push(block.height)
+      if (wrk.broken.has(block.height)) throw httpError(wrk.brokenStatus)
+      return block
     }
   }
   wrk._apiCall = async (fn, obj, args) => fn.call(obj, args)
@@ -345,6 +370,153 @@ test('syncBlockStats resumes the backfill when the history start moves earlier',
   t.ok(wrk.pageCalls.length > 0)
   t.is(wrk.state.backfilledToTs, BLOCK_STATS_START_TS)
   t.alike(storedSums(wrk), expectedRows(confirmed(chain)))
+})
+
+test('isBlockUnservable is true only for an upstream that answered and could not', (t) => {
+  t.ok(isBlockUnservable(httpError(500)))
+  t.ok(isBlockUnservable(httpError(404)))
+  t.absent(isBlockUnservable(httpError(429)))
+  t.absent(isBlockUnservable(httpError(502)))
+  t.absent(isBlockUnservable(httpError(503)))
+  t.absent(isBlockUnservable(new Error('ETIMEDOUT')))
+  t.absent(isBlockUnservable(new Error('ERR_BLOCK_STATS_INVALID_BLOCK')))
+})
+
+test('addLateBlockToRow adds a block inside the covered span exactly once', (t) => {
+  const ts = BLOCK_STATS_START_TS
+  const block = (height) => ({ height, ts, reward: 100, totalFees: 10, size: 1000 })
+  const row = addBlocksToRow(null, ts, [block(10), block(12)])
+
+  const healed = addLateBlockToRow(row, ts, block(11))
+  t.alike(healed, {
+    ts, blockCount: 3, blockRewardSum: 300, blockTotalFeesSum: 30, blockSizeSum: 3000, minHeight: 10, maxHeight: 12, lateHeights: [11]
+  })
+  t.is(addLateBlockToRow(healed, ts, block(11)), healed, 'a replay changes nothing')
+  t.is(row.blockCount, 2, 'the stored row is not mutated')
+
+  t.alike(addLateBlockToRow(null, ts, block(11)), {
+    ts, blockCount: 1, blockRewardSum: 100, blockTotalFeesSum: 10, blockSizeSum: 1000, minHeight: 11, maxHeight: 11, lateHeights: [11]
+  })
+})
+
+test('syncBlockStats walks past a block upstream cannot serve', async (t) => {
+  const chain = makeChain(70)
+  const wrk = makeWrk(chain)
+  const brokenHeight = FIRST_HEIGHT + 40
+  wrk.broken.add(brokenHeight)
+  const errors = silenceErrors(t)
+
+  await wrk.syncBlockStats()
+
+  const served = confirmed(chain).filter((block) => block.height !== brokenHeight)
+  t.alike(storedSums(wrk), expectedRows(served), 'every other block is counted, history reaches the start')
+  t.is(wrk.state.backfilledToTs, BLOCK_STATS_START_TS)
+  t.alike(Object.keys(wrk.state.skipped), [String(brokenHeight)])
+  t.ok(wrk.state.skipped[brokenHeight] > Date.now() + BLOCK_STATS_SKIPPED_RETRY_MS - 60000)
+  t.is(wrk.blockCalls.length, BLOCK_STATS_PAGE_SIZE, 'only the failing page is read block by block')
+  t.ok(errors.some((args) => String(args[1]).includes(`ERR_BLOCK_STATS_BLOCK_UNAVAILABLE height=${brokenHeight}`)))
+})
+
+test('syncBlockStats adds a skipped block once upstream serves it again', async (t) => {
+  const chain = makeChain(70)
+  const wrk = makeWrk(chain)
+  const brokenHeight = FIRST_HEIGHT + 40
+  wrk.broken.add(brokenHeight)
+  silenceErrors(t)
+  await wrk.syncBlockStats()
+
+  wrk.broken.clear()
+  wrk.blockCalls = []
+  await wrk.syncBlockStats()
+  t.alike(wrk.blockCalls, [], 'not retried before its wait is over')
+
+  wrk.state = { ...wrk.state, skipped: { [brokenHeight]: Date.now() - 1 } }
+  await wrk.syncBlockStats()
+  t.alike(wrk.blockCalls, [brokenHeight])
+  t.alike(storedSums(wrk), expectedRows(confirmed(chain)), 'the day is complete again')
+  t.alike(wrk.state.skipped, {})
+
+  wrk.state = { ...wrk.state, skipped: { [brokenHeight]: Date.now() - 1 } }
+  await wrk.syncBlockStats()
+  t.alike(storedSums(wrk), expectedRows(confirmed(chain)), 'a replayed retry does not count it twice')
+})
+
+test('syncBlockStats keeps waiting on a block that is still unavailable', async (t) => {
+  const chain = makeChain(70)
+  const wrk = makeWrk(chain)
+  const brokenHeight = FIRST_HEIGHT + 40
+  wrk.broken.add(brokenHeight)
+  silenceErrors(t)
+  await wrk.syncBlockStats()
+  const before = JSON.stringify([...wrk.rows])
+
+  wrk.state = { ...wrk.state, skipped: { [brokenHeight]: Date.now() - 1 } }
+  await wrk.syncBlockStats()
+
+  t.is(JSON.stringify([...wrk.rows]), before)
+  t.ok(wrk.state.skipped[brokenHeight] > Date.now(), 'pushed back for another day')
+})
+
+test('syncBlockStats skips a broken block near the tip too', async (t) => {
+  const chain = makeChain(90)
+  const wrk = makeWrk(chain.slice(0, 40))
+  await wrk.syncBlockStats()
+
+  const brokenHeight = FIRST_HEIGHT + 50
+  wrk.broken.add(brokenHeight)
+  wrk.chain = chain
+  silenceErrors(t)
+  await wrk.syncBlockStats()
+
+  t.alike(storedSums(wrk), expectedRows(confirmed(chain).filter((block) => block.height !== brokenHeight)))
+  t.alike(Object.keys(wrk.state.skipped), [String(brokenHeight)])
+  t.is(wrk.state.maxHeight, chain[chain.length - 1].height - BLOCK_STATS_CONFIRMATIONS)
+})
+
+test('syncBlockStats skips nothing when upstream fails block after block', async (t) => {
+  const chain = makeChain(70)
+  const wrk = makeWrk(chain)
+  for (const block of chain.slice(30, 45)) wrk.broken.add(block.height)
+  const errors = silenceErrors(t)
+
+  await wrk.syncBlockStats()
+
+  t.ok(errors.some((args) => String(args[2]).includes('ERR_BLOCK_STATS_UPSTREAM_UNHEALTHY')))
+  t.absent(wrk.state.skipped, 'an unwell upstream is waited out, not skipped over')
+  t.absent(wrk.state.backfilledToTs)
+
+  wrk.broken.clear()
+  await wrk.syncBlockStats()
+  t.alike(storedSums(wrk), expectedRows(confirmed(chain)))
+})
+
+test('syncBlockStats does not fall back or skip on gateway and network errors', async (t) => {
+  for (const status of [502, 503, 429, undefined]) {
+    const chain = makeChain(70)
+    const wrk = makeWrk(chain)
+    wrk.broken.add(FIRST_HEIGHT + 40)
+    wrk.brokenStatus = status
+    silenceErrors(t)
+
+    await wrk.syncBlockStats()
+
+    t.alike(wrk.blockCalls, [], `no block-by-block read on ${status}`)
+    t.absent(wrk.state.skipped)
+    t.absent(wrk.state.backfilledToTs)
+  }
+})
+
+test('getBlockHash reads the plain-text hash for a height', async (t) => {
+  const calls = []
+  const api = new MempoolApi({
+    get: async (path, opts) => {
+      calls.push({ path, opts })
+      return { body: 'abc123\n' }
+    }
+  })
+
+  t.is(await api.getBlockHash(975644), 'abc123')
+  t.alike(calls, [{ path: '/block-height/975644', opts: { encoding: 'text' } }])
 })
 
 test('getWrkExtData serves the hourly block stats store', async (t) => {

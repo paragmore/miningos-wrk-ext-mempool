@@ -1,6 +1,6 @@
 'use strict'
 
-const { MS_1_HOUR } = require('./constants')
+const { MS_1_HOUR, HTTP_STATUS_NOT_FOUND, HTTP_STATUS_INTERNAL_ERROR } = require('./constants')
 
 const hourBucket = (ts) => Math.floor(ts / MS_1_HOUR) * MS_1_HOUR
 
@@ -15,6 +15,12 @@ const toBlockStat = (block) => {
   if (!Object.values(stat).every(Number.isFinite)) throw new Error('ERR_BLOCK_STATS_INVALID_BLOCK')
   return stat
 }
+
+// Upstream answered, and the answer is that it cannot produce this block: a
+// block its own index is broken for. Gateway errors, timeouts and rate limits
+// are not this - they say nothing about the block and are simply retried.
+const isBlockUnservable = (err) =>
+  err?.status === HTTP_STATUS_INTERNAL_ERROR || err?.status === HTTP_STATUS_NOT_FOUND
 
 // The unbroken run of blocks ending at `to`, oldest first and no lower than
 // `from`. A page shorter than asked for comes back as a shorter run - never as
@@ -69,8 +75,32 @@ const addBlocksToRow = (row, ts, blocks) => {
   return next
 }
 
+// A block added out of order, after upstream could not serve it when its
+// height was walked. It sits inside the span the row already covers, so the
+// span cannot tell whether it was counted - its height is listed instead.
+const addLateBlockToRow = (row, ts, block) => {
+  if (row?.lateHeights?.includes(block.height)) return row
+
+  const next = addBlocksToRow(null, ts, [block])
+  if (!row) return { ...next, lateHeights: [block.height] }
+
+  return {
+    ...row,
+    blockCount: row.blockCount + 1,
+    blockRewardSum: row.blockRewardSum + block.reward,
+    blockTotalFeesSum: row.blockTotalFeesSum + block.totalFees,
+    blockSizeSum: row.blockSizeSum + block.size,
+    minHeight: Math.min(row.minHeight, block.height),
+    maxHeight: Math.max(row.maxHeight, block.height),
+    lateHeights: [...(row.lateHeights || []), block.height]
+  }
+}
+
 module.exports = {
   hourBucket,
+  toBlockStat,
+  isBlockUnservable,
+  addLateBlockToRow,
   pickBlocks,
   groupByHour,
   addBlocksToRow

@@ -20,6 +20,8 @@ const {
   BLOCK_STATS_CONFIRMATIONS,
   BLOCK_STATS_PAGE_SIZE,
   BLOCK_STATS_BACKFILL_CHUNK_PAGES,
+  BLOCK_STATS_SKIPPED_RETRY_MS,
+  BLOCK_STATS_MAX_SKIPPED_PER_PAGE,
   STAT_HASHRATE_HISTORY,
   HISTORICAL_HASHRATE_DATA_KEY,
   HISTORICAL_DATA_START_TS,
@@ -40,7 +42,15 @@ const {
   HTTP_STATUS_TOO_MANY_REQUESTS
 } = require('./lib/constants')
 const { extractRebates, parseSyncCron, lastCronFire } = require('./lib/rebatesSync')
-const { pickBlocks, groupByHour, addBlocksToRow } = require('./lib/blockStats')
+const {
+  hourBucket,
+  toBlockStat,
+  pickBlocks,
+  groupByHour,
+  addBlocksToRow,
+  addLateBlockToRow,
+  isBlockUnservable
+} = require('./lib/blockStats')
 const { getUTCMidnightTimestampsSince, priceBucket } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
@@ -373,6 +383,79 @@ class WrkMempoolRack extends TetherWrkBase {
     }
   }
 
+  // Blocks `from..to`, oldest first. Normally one page; a page upstream
+  // cannot produce is re-read block by block, so a single block its index is
+  // broken for costs that block rather than stalling the walk at its page
+  // forever. Such a block comes back in `skipped` and is retried later. More
+  // than a few in one page is upstream being unwell, not broken blocks, and
+  // nothing is skipped over that.
+  async _getBlockStatsRange (from, to) {
+    const api = this.mempoolApi
+    try {
+      const blocks = pickBlocks(await this._apiCall(api.getBlocks, api, to), from, to)
+      return { blocks, skipped: [], from: blocks[0].height }
+    } catch (err) {
+      if (!isBlockUnservable(err)) throw err
+    }
+
+    const blocks = []
+    const skipped = []
+    for (let height = from; height <= to; height++) {
+      const block = await this._getBlockStat(height)
+      if (block) blocks.push(block)
+      else skipped.push(height)
+      if (skipped.length > BLOCK_STATS_MAX_SKIPPED_PER_PAGE) throw new Error('ERR_BLOCK_STATS_UPSTREAM_UNHEALTHY')
+    }
+    return { blocks, skipped, from }
+  }
+
+  // Null only when upstream knows the height and still cannot serve the
+  // block; anything else throws and the run is retried.
+  async _getBlockStat (height) {
+    const api = this.mempoolApi
+    const hash = await this._apiCall(api.getBlockHash, api, height)
+    try {
+      return toBlockStat(await this._apiCall(api.getBlock, api, hash))
+    } catch (err) {
+      if (!isBlockUnservable(err)) throw err
+      console.error(new Date().toISOString(), `ERR_BLOCK_STATS_BLOCK_UNAVAILABLE height=${height}`)
+      return null
+    }
+  }
+
+  _withSkippedBlocks (state, heights, now = Date.now()) {
+    if (!heights.length) return state
+    const skipped = { ...state.skipped }
+    for (const height of heights) skipped[height] = now + BLOCK_STATS_SKIPPED_RETRY_MS
+    return { ...state, skipped }
+  }
+
+  // Skipped blocks get another try once their wait is over, and join their
+  // hour as soon as upstream can serve them.
+  async _retrySkippedBlockStats (state, now = Date.now()) {
+    const statKey = `${STAT_BLOCK_STATS_1H}-${MEMPOOL_TAG}`
+
+    for (const height of Object.keys(state.skipped || {}).map(Number)) {
+      if (state.skipped[height] > now || this._isApiThrottled()) continue
+
+      const block = await this._getBlockStat(height)
+      if (!block) {
+        state = this._withSkippedBlocks(state, [height], now)
+      } else {
+        if (block.ts >= BLOCK_STATS_START_TS) {
+          const ts = hourBucket(block.ts)
+          const row = await this._getDbRow(statKey, ts)
+          await this._saveToDbKey(statKey, ts, addLateBlockToRow(row, ts, block))
+        }
+        const { [height]: done, ...skipped } = state.skipped
+        state = { ...state, skipped }
+      }
+      await this._setBlockStatsState(state)
+    }
+
+    return state
+  }
+
   _isBlockStatsBackfilled (state) {
     return Number.isFinite(state.backfilledToTs) && state.backfilledToTs <= BLOCK_STATS_START_TS
   }
@@ -395,17 +478,17 @@ class WrkMempoolRack extends TetherWrkBase {
     while (state.maxHeight < target && !this._isApiThrottled()) {
       const from = state.maxHeight + 1
       const to = Math.min(state.maxHeight + pageSize, target)
-      const blocks = pickBlocks(await this._apiCall(api.getBlocks, api, to), from, to)
+      const range = await this._getBlockStatsRange(from, to)
 
       // Upstream returned a shorter page than assumed: nothing is stored from
       // it, and the walk carries on at the size it actually serves.
-      if (blocks[0].height > from) {
-        pageSize = this._blockStatsPageSize = blocks.length
+      if (range.from > from) {
+        pageSize = this._blockStatsPageSize = range.blocks.length
         continue
       }
 
-      await this._addBlockStats(blocks)
-      state = { ...state, maxHeight: to }
+      await this._addBlockStats(range.blocks)
+      state = this._withSkippedBlocks({ ...state, maxHeight: to }, range.skipped)
       await this._setBlockStatsState(state)
     }
 
@@ -416,7 +499,7 @@ class WrkMempoolRack extends TetherWrkBase {
   // the forward walk gets a turn in between and today's hours keep filling
   // while months of history are still being fetched.
   async _syncBlockStatsBackward (state, maxPages) {
-    const api = this.mempoolApi
+    const pageSize = this._blockStatsPageSize || BLOCK_STATS_PAGE_SIZE
 
     for (let page = 0; page < maxPages; page++) {
       if (this._isBlockStatsBackfilled(state) || this._isApiThrottled()) break
@@ -428,12 +511,12 @@ class WrkMempoolRack extends TetherWrkBase {
         break
       }
 
-      const blocks = pickBlocks(await this._apiCall(api.getBlocks, api, to), 0, to)
-      const wanted = blocks.filter((block) => block.ts >= BLOCK_STATS_START_TS)
+      const range = await this._getBlockStatsRange(Math.max(to - pageSize + 1, 0), to)
+      const wanted = range.blocks.filter((block) => block.ts >= BLOCK_STATS_START_TS)
       await this._addBlockStats(wanted)
 
-      state = { ...state, minHeight: blocks[0].height }
-      if (wanted.length < blocks.length) state.backfilledToTs = BLOCK_STATS_START_TS
+      state = this._withSkippedBlocks({ ...state, minHeight: range.from }, range.skipped)
+      if (wanted.length < range.blocks.length) state.backfilledToTs = BLOCK_STATS_START_TS
       await this._setBlockStatsState(state)
     }
 
@@ -448,6 +531,7 @@ class WrkMempoolRack extends TetherWrkBase {
       let state = await this._getBlockStatsState()
       for (;;) {
         state = await this._syncBlockStatsForward(state)
+        state = await this._retrySkippedBlockStats(state)
         if (this._isBlockStatsBackfilled(state) || this._isApiThrottled()) break
         state = await this._syncBlockStatsBackward(state, BLOCK_STATS_BACKFILL_CHUNK_PAGES)
       }
