@@ -12,6 +12,14 @@ const {
   HISTORICAL_PRICES_DATA_KEY,
   STAT_BLOCKSIZES,
   HISTORICAL_BLOCKSIZES_DATA_KEY,
+  STAT_BLOCK_STATS_1H,
+  HISTORICAL_BLOCK_STATS_DATA_KEY,
+  BLOCK_STATS_START_TS,
+  BLOCK_STATS_SYNC_BEE,
+  BLOCK_STATS_SYNC_INTERVAL_MS,
+  BLOCK_STATS_CONFIRMATIONS,
+  BLOCK_STATS_PAGE_SIZE,
+  BLOCK_STATS_BACKFILL_CHUNK_PAGES,
   STAT_HASHRATE_HISTORY,
   HISTORICAL_HASHRATE_DATA_KEY,
   HISTORICAL_DATA_START_TS,
@@ -32,6 +40,7 @@ const {
   HTTP_STATUS_TOO_MANY_REQUESTS
 } = require('./lib/constants')
 const { extractRebates, parseSyncCron, lastCronFire } = require('./lib/rebatesSync')
+const { pickBlocks, groupByHour, addBlocksToRow } = require('./lib/blockStats')
 const { getUTCMidnightTimestampsSince, priceBucket } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
 const gLibUtilBase = require('@bitfinex/lib-js-util-base')
@@ -133,6 +142,13 @@ class WrkMempoolRack extends TetherWrkBase {
           REBATES_SYNC_TICK_MS
         )
         this.maybeRunRebatesSync()
+
+        this.interval_mempool.add(
+          'block-stats-sync',
+          this.syncBlockStats.bind(this),
+          BLOCK_STATS_SYNC_INTERVAL_MS
+        )
+        this.syncBlockStats()
       }
     ], cb)
   }
@@ -341,6 +357,107 @@ class WrkMempoolRack extends TetherWrkBase {
     return timestamps.filter((ts) => !stored.has(ts))
   }
 
+  async _getBlockStatsState () {
+    return (await this._getRebatesKeyedRow(BLOCK_STATS_SYNC_BEE, 'state')) ?? {}
+  }
+
+  async _setBlockStatsState (state) {
+    await this._putRebatesKeyedRow(BLOCK_STATS_SYNC_BEE, 'state', state)
+  }
+
+  async _addBlockStats (blocks) {
+    const statKey = `${STAT_BLOCK_STATS_1H}-${MEMPOOL_TAG}`
+    for (const [ts, hourBlocks] of groupByHour(blocks)) {
+      const row = await this._getDbRow(statKey, ts)
+      await this._saveToDbKey(statKey, ts, addBlocksToRow(row, ts, hourBlocks))
+    }
+  }
+
+  _isBlockStatsBackfilled (state) {
+    return Number.isFinite(state.backfilledToTs) && state.backfilledToTs <= BLOCK_STATS_START_TS
+  }
+
+  // New blocks, oldest first, up to a few confirmations behind the tip: a
+  // block is only added once it can no longer be reorganised away, since a
+  // row is a running sum and cannot take a block back out.
+  async _syncBlockStatsForward (state) {
+    const api = this.mempoolApi
+    const tip = await this._apiCall(api.getBlockHeight, api)
+    if (!Number.isInteger(tip)) throw new Error('ERR_BLOCK_STATS_TIP')
+    const target = tip - BLOCK_STATS_CONFIRMATIONS
+
+    if (!Number.isInteger(state.maxHeight) || !Number.isInteger(state.minHeight)) {
+      state = { minHeight: target + 1, maxHeight: target }
+      await this._setBlockStatsState(state)
+    }
+
+    let pageSize = this._blockStatsPageSize || BLOCK_STATS_PAGE_SIZE
+    while (state.maxHeight < target && !this._isApiThrottled()) {
+      const from = state.maxHeight + 1
+      const to = Math.min(state.maxHeight + pageSize, target)
+      const blocks = pickBlocks(await this._apiCall(api.getBlocks, api, to), from, to)
+
+      // Upstream returned a shorter page than assumed: nothing is stored from
+      // it, and the walk carries on at the size it actually serves.
+      if (blocks[0].height > from) {
+        pageSize = this._blockStatsPageSize = blocks.length
+        continue
+      }
+
+      await this._addBlockStats(blocks)
+      state = { ...state, maxHeight: to }
+      await this._setBlockStatsState(state)
+    }
+
+    return state
+  }
+
+  // History, newest first, down to BLOCK_STATS_START_TS. Bounded per call so
+  // the forward walk gets a turn in between and today's hours keep filling
+  // while months of history are still being fetched.
+  async _syncBlockStatsBackward (state, maxPages) {
+    const api = this.mempoolApi
+
+    for (let page = 0; page < maxPages; page++) {
+      if (this._isBlockStatsBackfilled(state) || this._isApiThrottled()) break
+
+      const to = state.minHeight - 1
+      if (to < 0) {
+        state = { ...state, backfilledToTs: BLOCK_STATS_START_TS }
+        await this._setBlockStatsState(state)
+        break
+      }
+
+      const blocks = pickBlocks(await this._apiCall(api.getBlocks, api, to), 0, to)
+      const wanted = blocks.filter((block) => block.ts >= BLOCK_STATS_START_TS)
+      await this._addBlockStats(wanted)
+
+      state = { ...state, minHeight: blocks[0].height }
+      if (wanted.length < blocks.length) state.backfilledToTs = BLOCK_STATS_START_TS
+      await this._setBlockStatsState(state)
+    }
+
+    return state
+  }
+
+  async syncBlockStats () {
+    if (this._blockStatsSyncRunning) return
+    this._blockStatsSyncRunning = true
+
+    try {
+      let state = await this._getBlockStatsState()
+      for (;;) {
+        state = await this._syncBlockStatsForward(state)
+        if (this._isBlockStatsBackfilled(state) || this._isApiThrottled()) break
+        state = await this._syncBlockStatsBackward(state, BLOCK_STATS_BACKFILL_CHUNK_PAGES)
+      }
+    } catch (error) {
+      console.error(new Date().toISOString(), 'ERR_BLOCK_STATS_SYNC', error)
+    } finally {
+      this._blockStatsSyncRunning = false
+    }
+  }
+
   async saveHistoricalPrices () {
     if (this.fetchingHistoricalPricesData) return
     this.fetchingHistoricalPricesData = true
@@ -498,6 +615,13 @@ class WrkMempoolRack extends TetherWrkBase {
     await db.close()
   }
 
+  async _getDbRow (key, ts) {
+    const db = await this._getBee(key)
+    const entry = await db.get(utilsStore.convIntToBin(ts))
+    await db.close()
+    return entry ? JSON.parse(entry.value.toString()) : null
+  }
+
   async _getDbData (key, { start, end, limit = 100 }) {
     const db = await this._getBee(key)
     const stream = db.createReadStream({
@@ -584,6 +708,7 @@ class WrkMempoolRack extends TetherWrkBase {
 
   _getHistoricalExtDataLogKey (key) {
     if (key === HISTORICAL_BLOCKSIZES_DATA_KEY) return STAT_BLOCKSIZES
+    if (key === HISTORICAL_BLOCK_STATS_DATA_KEY) return STAT_BLOCK_STATS_1H
     if (key === HISTORICAL_HASHRATE_DATA_KEY) return STAT_HASHRATE_HISTORY
     if (key === HISTORICAL_PRICES_DATA_KEY) return STAT_PRICES
   }
@@ -868,7 +993,12 @@ class WrkMempoolRack extends TetherWrkBase {
       return await this.getPricesAtTimestamps(args.query)
     }
 
-    if ([HISTORICAL_PRICES_DATA_KEY, HISTORICAL_BLOCKSIZES_DATA_KEY, HISTORICAL_HASHRATE_DATA_KEY].includes(args.query?.key)) {
+    if ([
+      HISTORICAL_PRICES_DATA_KEY,
+      HISTORICAL_BLOCKSIZES_DATA_KEY,
+      HISTORICAL_BLOCK_STATS_DATA_KEY,
+      HISTORICAL_HASHRATE_DATA_KEY
+    ].includes(args.query?.key)) {
       const key = `${this._getHistoricalExtDataLogKey(args.query.key)}-${MEMPOOL_TAG}`
       return await this._getDbData(key, args.query)
     }
