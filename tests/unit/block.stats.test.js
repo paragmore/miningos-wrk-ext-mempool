@@ -8,7 +8,8 @@ const {
   groupByHour,
   addBlocksToRow,
   addLateBlockToRow,
-  isBlockUnservable
+  isBlockUnservable,
+  isPageUnusable
 } = require('../../workers/lib/blockStats')
 const MempoolApi = require('../../workers/lib/mempool.api')
 const {
@@ -63,7 +64,8 @@ const storedSums = (wrk) => {
 const httpError = (status) => Object.assign(new Error(`ERR_HTTP: ${status}`), { status })
 
 // `broken` heights behave like a block the upstream index cannot produce: the
-// page holding one fails, and so does the block itself.
+// page holding one fails, and so does the block itself. `holes` are the same
+// block reported the quiet way - the page answers without it.
 const makeWrk = (chain, { pageSize = BLOCK_STATS_PAGE_SIZE } = {}) => {
   const wrk = Object.create(WrkMempoolRack.prototype)
   wrk.chain = chain
@@ -72,6 +74,7 @@ const makeWrk = (chain, { pageSize = BLOCK_STATS_PAGE_SIZE } = {}) => {
   wrk.pageCalls = []
   wrk.blockCalls = []
   wrk.broken = new Set()
+  wrk.holes = new Set()
   wrk.brokenStatus = 500
   wrk.mempoolApi = {
     getBlockHeight: async () => wrk.chain[wrk.chain.length - 1].height,
@@ -81,13 +84,16 @@ const makeWrk = (chain, { pageSize = BLOCK_STATS_PAGE_SIZE } = {}) => {
         .filter((block) => block.height <= height && block.height > height - pageSize)
         .reverse()
       if (page.some((block) => wrk.broken.has(block.height))) throw httpError(wrk.brokenStatus)
-      return page
+      return page.filter((block) => !wrk.holes.has(block.height))
     },
-    getBlockHash: async (height) => `hash-${height}`,
+    getBlockHash: async (height) => {
+      if (!wrk.chain.some((block) => block.height === height)) throw httpError(404)
+      return `hash-${height}`
+    },
     getBlock: async (hash) => {
       const block = wrk.chain.find((candidate) => candidate.id === hash)
       wrk.blockCalls.push(block.height)
-      if (wrk.broken.has(block.height)) throw httpError(wrk.brokenStatus)
+      if (wrk.broken.has(block.height) || wrk.unservedHoles?.has(block.height)) throw httpError(wrk.brokenStatus)
       return block
     }
   }
@@ -382,6 +388,14 @@ test('isBlockUnservable is true only for an upstream that answered and could not
   t.absent(isBlockUnservable(new Error('ERR_BLOCK_STATS_INVALID_BLOCK')))
 })
 
+test('isPageUnusable also covers a page that answers without its block', (t) => {
+  t.ok(isPageUnusable(httpError(500)))
+  t.ok(isPageUnusable(new Error('ERR_BLOCK_STATS_EMPTY_PAGE')))
+  t.absent(isPageUnusable(new Error('ERR_BLOCK_STATS_INVALID_PAGE')))
+  t.absent(isPageUnusable(new Error('ERR_BLOCK_STATS_INVALID_BLOCK')))
+  t.absent(isPageUnusable(httpError(503)))
+})
+
 test('addLateBlockToRow adds a block inside the covered span exactly once', (t) => {
   const ts = BLOCK_STATS_START_TS
   const block = (height) => ({ height, ts, reward: 100, totalFees: 10, size: 1000 })
@@ -415,6 +429,57 @@ test('syncBlockStats walks past a block upstream cannot serve', async (t) => {
   t.ok(wrk.state.skipped[brokenHeight] > Date.now() + BLOCK_STATS_SKIPPED_RETRY_MS - 60000)
   t.is(wrk.blockCalls.length, BLOCK_STATS_PAGE_SIZE, 'only the failing page is read block by block')
   t.ok(errors.some((args) => String(args[1]).includes(`ERR_BLOCK_STATS_BLOCK_UNAVAILABLE height=${brokenHeight}`)))
+})
+
+test('syncBlockStats reads a block the page leaves out, in history and near the tip', async (t) => {
+  const chain = makeChain(90)
+  const wrk = makeWrk(chain.slice(0, 60))
+  wrk.holes.add(FIRST_HEIGHT + 30)
+  wrk.holes.add(FIRST_HEIGHT + 70)
+
+  await wrk.syncBlockStats()
+  t.alike(storedSums(wrk), expectedRows(confirmed(chain.slice(0, 60))), 'the hole is filled from the single-block read')
+  t.is(wrk.state.backfilledToTs, BLOCK_STATS_START_TS, 'history is not stalled at the hole')
+
+  wrk.chain = chain
+  await wrk.syncBlockStats()
+  t.alike(storedSums(wrk), expectedRows(confirmed(chain)))
+  t.absent(wrk.state.skipped && Object.keys(wrk.state.skipped).length)
+  t.absent(wrk._blockStatsPageSize, 'the page size narrowed on the way to the hole is not kept')
+})
+
+test('syncBlockStats skips a block that is missing from its page and cannot be read alone', async (t) => {
+  const chain = makeChain(70)
+  const wrk = makeWrk(chain)
+  const holeHeight = FIRST_HEIGHT + 30
+  wrk.holes.add(holeHeight)
+  wrk.unservedHoles = new Set([holeHeight])
+  silenceErrors(t)
+
+  await wrk.syncBlockStats()
+
+  t.alike(storedSums(wrk), expectedRows(confirmed(chain).filter((block) => block.height !== holeHeight)))
+  t.alike(Object.keys(wrk.state.skipped), [String(holeHeight)])
+  t.is(wrk.state.backfilledToTs, BLOCK_STATS_START_TS)
+})
+
+test('syncBlockStats keeps a first-run cursor from wiping other sync state', async (t) => {
+  const wrk = makeWrk(makeChain(40))
+  wrk.state = { skipped: { 5: 1 } }
+  silenceErrors(t)
+
+  await wrk.syncBlockStats()
+
+  t.ok(Number.isInteger(wrk.state.maxHeight))
+  t.is(wrk.state.skipped[5], 1)
+})
+
+test('_getBlockStat refuses a block that is not the height asked for', async (t) => {
+  const chain = makeChain(10)
+  const wrk = makeWrk(chain)
+  wrk.mempoolApi.getBlockHash = async () => chain[3].id
+
+  await t.exception(wrk._getBlockStat(FIRST_HEIGHT + 5), /ERR_BLOCK_STATS_HEIGHT_MISMATCH/)
 })
 
 test('syncBlockStats adds a skipped block once upstream serves it again', async (t) => {
@@ -507,16 +572,24 @@ test('syncBlockStats does not fall back or skip on gateway and network errors', 
 })
 
 test('getBlockHash reads the plain-text hash for a height', async (t) => {
+  const hash = '000000000000000000000c51455703cde1758cd47e34fc903e95e592fadb21b0'
   const calls = []
   const api = new MempoolApi({
     get: async (path, opts) => {
       calls.push({ path, opts })
-      return { body: 'abc123\n' }
+      return { body: `${hash}\n` }
     }
   })
 
-  t.is(await api.getBlockHash(975644), 'abc123')
+  t.is(await api.getBlockHash(975644), hash)
   t.alike(calls, [{ path: '/block-height/975644', opts: { encoding: 'text' } }])
+})
+
+test('getBlockHash rejects anything that is not a block hash', async (t) => {
+  for (const body of ['', '<html>Bad Gateway</html>', 'Block height out of range', 'abc123', undefined]) {
+    const api = new MempoolApi({ get: async () => ({ body }) })
+    await t.exception(api.getBlockHash(1), /ERR_BLOCK_HASH_INVALID/)
+  }
 })
 
 test('getWrkExtData serves the hourly block stats store', async (t) => {

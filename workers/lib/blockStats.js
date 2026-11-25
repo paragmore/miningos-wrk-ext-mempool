@@ -2,6 +2,8 @@
 
 const { MS_1_HOUR, HTTP_STATUS_NOT_FOUND, HTTP_STATUS_INTERNAL_ERROR } = require('./constants')
 
+const ERR_EMPTY_PAGE = 'ERR_BLOCK_STATS_EMPTY_PAGE'
+
 const hourBucket = (ts) => Math.floor(ts / MS_1_HOUR) * MS_1_HOUR
 
 const toBlockStat = (block) => {
@@ -22,6 +24,10 @@ const toBlockStat = (block) => {
 const isBlockUnservable = (err) =>
   err?.status === HTTP_STATUS_INTERNAL_ERROR || err?.status === HTTP_STATUS_NOT_FOUND
 
+// A page that answered but does not hold the block it was asked for: the same
+// broken block, reported as a hole rather than as an error.
+const isPageUnusable = (err) => isBlockUnservable(err) || err?.message === ERR_EMPTY_PAGE
+
 // The unbroken run of blocks ending at `to`, oldest first and no lower than
 // `from`. A page shorter than asked for comes back as a shorter run - never as
 // a run with a hole in it, which would leave a block out of the sums for good.
@@ -37,7 +43,7 @@ const pickBlocks = (page, from, to) => {
   for (let height = to; height >= from && byHeight.has(height); height--) {
     blocks.unshift(toBlockStat(byHeight.get(height)))
   }
-  if (!blocks.length) throw new Error('ERR_BLOCK_STATS_EMPTY_PAGE')
+  if (!blocks.length) throw new Error(ERR_EMPTY_PAGE)
   return blocks
 }
 
@@ -80,9 +86,7 @@ const addBlocksToRow = (row, ts, blocks) => {
 // span cannot tell whether it was counted - its height is listed instead.
 const addLateBlockToRow = (row, ts, block) => {
   if (row?.lateHeights?.includes(block.height)) return row
-
-  const next = addBlocksToRow(null, ts, [block])
-  if (!row) return { ...next, lateHeights: [block.height] }
+  if (!row) return { ...addBlocksToRow(null, ts, [block]), lateHeights: [block.height] }
 
   return {
     ...row,
@@ -100,6 +104,7 @@ module.exports = {
   hourBucket,
   toBlockStat,
   isBlockUnservable,
+  isPageUnusable,
   addLateBlockToRow,
   pickBlocks,
   groupByHour,

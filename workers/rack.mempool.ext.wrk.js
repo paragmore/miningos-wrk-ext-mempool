@@ -49,7 +49,8 @@ const {
   groupByHour,
   addBlocksToRow,
   addLateBlockToRow,
-  isBlockUnservable
+  isBlockUnservable,
+  isPageUnusable
 } = require('./lib/blockStats')
 const { getUTCMidnightTimestampsSince, priceBucket } = require('./lib/utils')
 const utilsStore = require('@tetherto/hp-svc-facs-store/utils')
@@ -395,8 +396,12 @@ class WrkMempoolRack extends TetherWrkBase {
       const blocks = pickBlocks(await this._apiCall(api.getBlocks, api, to), from, to)
       return { blocks, skipped: [], from: blocks[0].height }
     } catch (err) {
-      if (!isBlockUnservable(err)) throw err
+      if (!isPageUnusable(err)) throw err
     }
+
+    // The forward walk narrows its page size on the way to a hole; whatever
+    // it settled on described the hole, not what upstream serves.
+    this._blockStatsPageSize = undefined
 
     const blocks = []
     const skipped = []
@@ -415,7 +420,9 @@ class WrkMempoolRack extends TetherWrkBase {
     const api = this.mempoolApi
     const hash = await this._apiCall(api.getBlockHash, api, height)
     try {
-      return toBlockStat(await this._apiCall(api.getBlock, api, hash))
+      const block = toBlockStat(await this._apiCall(api.getBlock, api, hash))
+      if (block.height !== height) throw new Error('ERR_BLOCK_STATS_HEIGHT_MISMATCH')
+      return block
     } catch (err) {
       if (!isBlockUnservable(err)) throw err
       console.error(new Date().toISOString(), `ERR_BLOCK_STATS_BLOCK_UNAVAILABLE height=${height}`)
@@ -470,12 +477,12 @@ class WrkMempoolRack extends TetherWrkBase {
     const target = tip - BLOCK_STATS_CONFIRMATIONS
 
     if (!Number.isInteger(state.maxHeight) || !Number.isInteger(state.minHeight)) {
-      state = { minHeight: target + 1, maxHeight: target }
+      state = { ...state, minHeight: target + 1, maxHeight: target }
       await this._setBlockStatsState(state)
     }
 
-    let pageSize = this._blockStatsPageSize || BLOCK_STATS_PAGE_SIZE
     while (state.maxHeight < target && !this._isApiThrottled()) {
+      const pageSize = this._blockStatsPageSize || BLOCK_STATS_PAGE_SIZE
       const from = state.maxHeight + 1
       const to = Math.min(state.maxHeight + pageSize, target)
       const range = await this._getBlockStatsRange(from, to)
@@ -483,7 +490,7 @@ class WrkMempoolRack extends TetherWrkBase {
       // Upstream returned a shorter page than assumed: nothing is stored from
       // it, and the walk carries on at the size it actually serves.
       if (range.from > from) {
-        pageSize = this._blockStatsPageSize = range.blocks.length
+        this._blockStatsPageSize = range.blocks.length
         continue
       }
 
@@ -499,10 +506,9 @@ class WrkMempoolRack extends TetherWrkBase {
   // the forward walk gets a turn in between and today's hours keep filling
   // while months of history are still being fetched.
   async _syncBlockStatsBackward (state, maxPages) {
-    const pageSize = this._blockStatsPageSize || BLOCK_STATS_PAGE_SIZE
-
     for (let page = 0; page < maxPages; page++) {
       if (this._isBlockStatsBackfilled(state) || this._isApiThrottled()) break
+      const pageSize = this._blockStatsPageSize || BLOCK_STATS_PAGE_SIZE
 
       const to = state.minHeight - 1
       if (to < 0) {

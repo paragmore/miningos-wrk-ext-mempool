@@ -51,7 +51,9 @@ class MempoolApi {
 
   async getBlockHash (height) {
     const { body } = await this._http.get(`/block-height/${height}`, { encoding: 'text' })
-    return String(body).trim()
+    const hash = String(body).trim()
+    if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error('ERR_BLOCK_HASH_INVALID')
+    return hash
   }
 
   // Extended blocks, newest first, from `height` downwards.
